@@ -1,0 +1,584 @@
+---
+title: 8. Stochastic Methods
+author: Takumi SHIBUYA
+date: 2020-06-05
+---
+
+# Deterministic な最適化手法の問題
+
+- 局所最適解に陥る。
+- 初期値をランダムにすることでも可能だが，限界はある。
+
+## 親の顔より見た鞍点の例
+
+```julia
+f(x, y) = x^2 - y^2
+
+using Plots
+x = [-2:0.1:2;]
+y = copy(x)
+z = [f(i, j) for i in x, j in y]'
+
+plot(x, y, z, st=:surface)
+```
+
+# Noisy Descent
+
+----
+
+- **DescentMethod** の亜種。
+- 勾配方向に確率的なノイズを加えることで，局所最適解に陥ることを避ける。
+- 繰り返しごとにノイズを徐々に減らしていく。
+
+収束を保証するためのステップサイズの条件:
+
+$$
+\sum^\infty_{k=1}\alpha^{(k)}=\infty, \\ \sum^\infty_{k=1}(\alpha^{(k)})^2 < \infty .
+$$
+
+### アルゴリズム
+
+1. 候補点における勾配を求める。
+2. 勾配にノイズを加えたものを利用して，次の候補点を決定する。
+
+### コード
+
+```julia; echo = false
+include(pwd() * "/Chapter4/LineSearch.jl");
+include(pwd() * "/Chapter5/DescentMethod.jl");
+```
+
+※あらかじめ，`line_search`などの必要な関数と構造体を定義しておく。
+
+```julia
+mutable struct NoisyDescent <: DescentMethod
+    submethod
+    σ
+    k
+end
+
+function init!(M::NoisyDescent, f, ∇f, x)
+    init!(M.submethod, f, ∇f, x)
+    M.k = 1
+    return M
+end
+
+function step!(M::NoisyDescent, f, ∇f, x)
+    x = step!(M.submethod, f, ∇f, x)
+    σ = M.σ(M.k)
+    x += σ .* randn(length(x))
+    M.k += 1
+    return x
+end
+
+function noisy_descent(f, ∇f, x, M::NoisyDescent)
+    x₀ = copy(x)
+    init!(M, f, ∇f, x₀)
+    t = 0
+    res = copy(x)
+    while true
+        t += 1
+        x₁ = step!(M, f, ∇f, x₀)
+        # @show x₁
+        if all(abs.(x₀ - x₁) .< 0.001) || t == 100
+            res = [res x₁]
+            return x₁, res
+        else
+            x₀ = copy(x₁)
+            res = [res x₁]
+        end
+    end
+end
+
+```
+
+### Gradient Descentとの比較
+
+```julia
+f(x) = x[1]^2 - x[2]^2
+∇f(x) = [2x[1], -2x[2]]
+
+using Plots
+x = [-4:0.1:4;]
+y = copy(x)
+z = [f([i, j]) for i in x, j in y]'
+
+# plot(x, y, z, st=:surface) # 3D plot
+plot(x, y, z)
+
+# Gradient Descent
+include(pwd() * "/Chapter4/LineSearch.jl");
+include(pwd() * "/Chapter5/DescentMethod.jl");
+opt, history = gradient_descent(f, ∇f, [2, 0], GradientDescent(0.1))
+
+plot(x, y, z)
+plot!(history[1, :], history[2, :], c = :black, label = "Gradient Descent")
+
+# Stochastic version
+g(x) = 1/x;
+using Random;
+Random.seed!(02040204);
+opt, history = noisy_descent(f, ∇f, [2, 0], NoisyDescent(GradientDescent(0.1), g, 1));
+@show opt
+plot!(history[1, 1:10], history[2, 1:10], c = :blue, label = "Noisy Descent")
+```
+
+# Mesh Adaptive Direct Search
+
+----
+
+- **Generalized Pattern Search** の亜種。
+- n+1もしくは2nの線形結合により表されるposotive spanning setの選択を，確率的に行う。
+- 三角行列を利用することで，$\alpha \ge 1$であれば，必ずn-1個の線形独立なベクトルができる（図の1と3列目）。
+
+![MADS](figure/MeshAdaptive.png)
+
+### 行列の要素の選び方。
+
+次のベクトルからランダムに選択される:
+
+$$
+\left\{ -1/\sqrt{\alpha^{k}}-1, -1/\sqrt{\alpha^{k}}+2, ..., 1/\sqrt{\alpha^{k}}-1 \right\}.
+$$
+
+ただし，$\alpha$は1を超えないものとし，移動がなかったステップごとに$1/4$倍されていく。
+
+
+### Generalized Pattern Search との違い。
+
+- 最適な方向を見つけたあとに，ステップサイズを大きく（3倍）し，動的に探索次元の順番を入れ替えない。
+    - こうすることで次の探索方向は，メッシュの外になる(かもしれない)。
+- 探索次元が毎回ランダムに決定される。
+
+![MADS2](figure/MeshAdaptive2.png)
+
+### アルゴリズム
+
+```julia
+using LinearAlgebra # 線形代数用のライブラリ
+
+function rand_positive_spanning_set(α, n)
+    δ = round(Int, 1/sqrt(α)) # Int(round(1/sqrt(α))) よりも効率的。
+    L = Matrix(Diagonal(δ * rand([1, -1], n))) # 対角行列
+    for i in 1:n-1, j in i+1:n
+        L[i, j] = rand(-δ+1:δ-1)
+    end
+    @show L # Upper triangular.
+    D = L[randperm(n), :]
+    # D = L[:, randperm(n)]
+    D = hcat(D, -sum(D, dims = 2)) # is identical to colsums() in R
+    return [D[:, i] for i in 1:n+1]
+end
+
+function mesh_adaptive_direct_search(f, x, α, ϵ, γ = 0.5)
+    y, n = f(x), length(x)
+    while α > ϵ
+        improved = false
+        L = rand_positive_spanning_set(α, n) # L is an array of array, not a matrix.
+        for (i, d) in enumerate(L)
+            x′ = x + α*d
+            y′ = f(x′)
+            if y′ < y
+                x, y, improved = x′, y′, ture
+                x′ = x + 3α*d # the outside of the mesh
+                y′ = f(x′)
+                if y′ < y # もし新しい候補点を飛び越えた先が，候補点よりも最適であれば
+                    x, y = x′, y′
+                end
+                break
+            end
+        end
+        α = improved ? min(1, 4α) : α/4
+    end
+    return x
+end
+```
+
+# Simulated Annealing
+
+----
+
+### 性質
+
+- （金属の）焼きなましの過程で，分子運動の動きが温度によって変化する様子を，シミュレーションする。
+    - 物体が高温のうちは分子運動が大きく，より安定した状態へと移ろうとするが，温度が徐々に下がっていくと，分子運動が低下し，整った結晶状態で固まる。
+    - 急速に冷やし過ぎると，不安定な状態で固まってしまう。
+
+### 最適化手法としての性質
+
+- 多数の局所最適解を持つ最適化関数によく用いられる。
+    - e.g, Ackely function
+- Rの `Optim(..., method = "SANN")`
+
+### アルゴリズム
+
+1. 候補点$x$に遷移分布$\exp(T)$からサンプルした疑似乱数を加えた$x'$を得る。
+2. 疑似乱数を加えた，$y' = f(x')$と$y=f(x)$の差分$\nabla y$を評価し，
+    - もし$\nabla y \le 1$ならば$P = 1$
+    - もし$\nabla y > 1$ならば$P = \min(\exp(-\nabla y/t), 1)$
+    で，$y'$を採択する。
+3. 温度を下げて，再び1に戻る。
+
+### 注意点
+
+- 遷移分布の選び方
+    - ガウス分布で良い？
+    - 分散を広げすぎると，効率が悪くなる。
+- 温度の下げ方=annealing scheduleの選び方。
+    - logarithmic annealing schedule: $t^{(k)} = t^{(1)} \ln(2)/ \ln(k+1)$
+    - exponential ~ : $t^{(k+1)} = \gamma t^{(k)} , \  \text{where} \ \gamma \in (0, 1)$
+    - fast ~: $t^{(k)} = \frac{t^{(1)}}{k}$
+
+### コード
+
+```julia
+function simulated_annealing(f, x, T, t, k_max)
+    y = f(x)
+    x_best, y_best = x, y
+    res = zeros(k_max, length(x))
+    for k in 1 : k_max
+        x′ = x + rand(T)
+        y′ = f(x′)
+        Δy = y′ - y
+        if Δy ≤ 0 || rand() < exp(-Δy/t(k))
+            x, y = x′, y′
+        end
+        if y′ < y_best
+            x_best, y_best = x′, y′
+        end
+        length(x) != 1 ? res[k, :] = x_best[:] : res[k, 1] = x_best[1]
+    end
+    return x_best, res
+end
+
+log_schedule(k) = k == 1 ? 10.0 : log_schedule(1) * log(2)/log(k + 1)
+exp_schedule(k, γ = 0.5) = k == 1 ? 10.0 : exp_schedule(k-1, γ) * γ
+fast_schedule(k) = k == 1 ? 10.0 : fast_schedule(1) / k
+```
+
+```julia
+include(pwd() * "/Chapter8/Ackely.jl")
+
+using Distributions, LinearAlgebra
+Random.seed!(0204)
+opt, history = simulated_annealing(ackley, [15, 15], MvNormal([0, 0], 25), x -> exp_schedule(x, 1/4), 10000)
+x, y = [-15:0.1:15;], [-15:0.1:15;]
+z = [ackley([i, j]) for i in x, j in y]'
+@show opt
+plot(x, y, z, st = :surface)
+plot!(history[:, 1], history[:, 2], [ackley(history[k, :]) for k in 1:1000], c = :green, label = "")
+```
+
+## Adaptive SANN
+
+----
+
+- SANNの改良版
+    - SANNでは，棄却率が高い＝無駄な計算が多い，採択率が高い＝現在の候補点に停留する可能性が高く，更新が遅い。
+    - 候補点に加えるノイズを，採択率と棄却率から適応的に変化させる。
+
+<!-- ![ASANN1](figure/ASANN1.png)
+![ASANN2](figure/ASANN2.png) -->
+
+
+$$
+\bf x' = \bf x + \it rv_i \bf e_i
+$$
+
+ステップサイズの決め方:
+
+$$
+v_{i}=\left\{\begin{array}{ll}
+v_{i}\left(1+c_{i} \frac{a_{i} / n_{s}-0.6}{0.4}\right) & \text { if } a_{i}>0.6 n_{s} \\
+v_{i}\left(1+c_{i} \frac{0.4-a_{i} / n_{s}}{0.4}\right)^{-1} & \text {if } a_{i}<0.4 n_{s} \\
+v_{i} & \text { otherwise }
+\end{array}\right.
+$$
+
+### コード
+
+```julia
+function corana_update!(v, a, c, ns)
+    for i in 1 : length(v)
+        ai, ci = a[i], c[i]
+        if ai > 0.6ns
+            v[i] *= (1 + ci*(ai/ns - 0.6)/0.4)
+        elseif ai < 0.4ns
+            v[i] /= (1 + ci*(0.4-ai/ns)/0.4)
+        end
+    end
+    return v
+end
+
+function adaptive_simulated_annealing(f, x, v, t, ε; ns=20, nε=4, nt=max(100,5length(x)), γ=0.85, c=fill(2,length(x)) )
+    y = f(x)
+    x_best, y_best = x, y
+    y_arr, n, U = [], length(x), Uniform(-1.0,1.0)
+    a, counts_cycles, counts_resets = zeros(n), 0, 0
+    while true
+        for i in 1:n
+            x′ = x + basis(i,n)*rand(U)*v[i]
+            y′ = f(x′)
+            Δy = y′ - y
+            if Δy < 0 || rand() < exp(-Δy/t)
+                x, y = x′, y′
+                a[i] += 1
+                if y′ < y_best
+                    x_best, y_best = x′, y′
+                end
+            end
+        end
+        counts_cycles += 1
+        counts_cycles ≥ ns || continue
+
+        counts_cycles = 0
+        corana_update!(v, a, c, ns)
+        fill!(a, 0)
+        counts_resets += 1
+        counts_resets ≥ nt || continue
+
+        t *= γ
+        counts_resets = 0
+        push!(y_arr, y)
+
+        if !(length(y_arr) > nε && y_arr[end] - y_best ≤ ε && all(abs(y_arr[end]-y_arr[end-u]) ≤ ε for u in 1:nε))
+            x, y = x_best, y_best
+        else
+            break
+        end
+    end
+    return x_best
+end
+```
+
+# Cross-Entropy Method
+
+----
+
+- 提案分布からのサンプリングを用いる手法
+
+### アルゴリズム
+
+1. 提案分布から$m$個の候補点をサンプリングし，関数の評価値を得る。
+2. サンプリングした$m$個の候補点のうち，最も低い点のいくつか（$m_{elite}$）を使って次の提案分布のパラメタを最尤推定する。
+3. 1に戻って，所定の反復回数繰り返す。
+
+![CE](figure/CE.png)
+
+# Natural Evolution Strategies
+
+- 正規分布（提案分布）からのサンプリングを用いて，関数の評価値そのものではなく，期待値の勾配を計算し，それを利用してGradient Descentなどの勾配降下法を行う。
+
+$$
+\begin{aligned}
+\nabla_{\mathbf{\theta}} \mathbb{E}_{\mathbf{x} \sim p(\cdot | \boldsymbol{\theta})}[f(\mathbf{x})] &=\int \nabla_{\mathbf{\theta}} p(\mathbf{x} | \boldsymbol{\theta}) f(\mathbf{x}) d \mathbf{x} \\
+&=\int \frac{p(\mathbf{x} | \boldsymbol{\theta})}{p(\mathbf{x} | \boldsymbol{\theta})} \nabla_{\boldsymbol{\theta}} p(\mathbf{x} | \boldsymbol{\theta}) f(\mathbf{x}) d \mathbf{x} \\
+&=\int p(\mathbf{x} | \boldsymbol{\theta}) \nabla_{\mathbf{\theta}} \log p(\mathbf{x} | \boldsymbol{\theta}) f(\mathbf{x}) d \mathbf{x} \\
+&=\mathbb{E}_{\mathbf{x} \sim p(\cdot | \boldsymbol{\theta})}\left[f(\mathbf{x}) \nabla_{\mathbf{\theta}} \log p(\mathbf{x} | \boldsymbol{\theta})\right] \\
+& \approx \frac{1}{m} \sum_{i=1}^{m} f\left(\mathbf{x}^{(i)}\right) \nabla_{\boldsymbol{\theta}} \log p\left(\mathbf{x}^{(i)} | \boldsymbol{\theta}\right)
+\end{aligned}
+$$
+
+※2行目から3行目にかけて，$\frac{\nabla_{\theta} p(X, \theta)}{p(X, \theta)}=\nabla_{\theta} \log p(X, \theta)$を利用。
+
+- 勾配の計算には対数尤度の勾配が利用される。
+
+### juliaによる実装
+
+```julia
+using Distributions # 確率分布を扱うパッケージ（結構模範的に作られている）
+
+function natural_evolution_strategies(f, θ, k_max; m=100, α=0.01)
+    for k in 1 : k_max
+        samples = [rand(θ) for i in 1 : m]
+        θ -= α*sum(f(x)*∇logp(x, θ) for x in samples)/m
+    end
+    return θ
+end
+
+# Gaussian Version
+function natural_evolution_strategies(f, μ, Σ, k_max; m=100, α=0.01)
+    ∇μlogp(x, θ, Σ) = inv(Σ) * (x - μ)
+    ∇Σlogp(x, θ, Σ) = 1/2 * inv(Σ) * (x - μ) * (x - μ)' * inv(Σ) - 1/2 * inv(Σ)
+    ∇Alogp(x, θ, Σ, A) = A * (∇Σlogp(x, θ, Σ) + ∇Σlogp(x, θ, Σ)')
+    A = sqrt(Σ)
+    for k in 1 : k_max
+        samples = [rand(MvNormal(μ, Σ)) for i in 1:m]
+        μ -= α*sum(f(x)*∇μlogp(x, μ, Σ) for x in samples)/m
+        # Σ -= α*sum(f(x)*∇Σlogp(x, μ, Σ) for x in samples)/m
+        A -= α*sum(f(x)*∇Alogp(x, μ, Σ, A) for x in samples)/m
+        Σ = A'A
+    end
+    return μ, Σ
+end
+
+```
+
+# Covariance Matrix Adaptation (Evolutionary Strategy)
+
+- 提案分布からのサンプリングを利用する。
+- Cross-Entropy Methodのように，最適な候補点の上位だけをとって，次の提案分布を決定する。
+    - 平均と分散共分散行列の計算には重みを利用する。
+- ステップサイズを繰り返しごとに最適化する。
+
+### アルゴリズム
+
+1. **正規分布からサンプリング**
+2. **加重平均を計算**
+
+$$
+\boldsymbol{\mu}^{(k+1)} \leftarrow \sum_{i=1}^{m} w_{i} \mathbf{x}^{(i)}
+$$
+
+$$
+w_{i}^{\prime}=\ln \frac{m+1}{2}-\ln i \text { for } i \in\{1, \ldots, m\}
+$$
+
+※ただしこれは規格化される。
+
+```julia
+using LinearAlgebra
+function weight_value(m, M = 100)
+    normalize(log((M + 1) / 2) .- log.(1:m), 1)
+end
+
+plot(1:10, weight_value(10), label = "log(M+1)/2 - log(1:m)")
+```
+
+3. **ステップサイズを計算**
+
+累積ステップサイズ:
+
+$$
+\begin{aligned}
+\mathbf{p}_{\sigma}^{(1)} &=\mathbf{0} \\
+\mathbf{p}_{\sigma}^{(k+1)} & \leftarrow\left(1-c_{\sigma}\right) \mathbf{p}_{\sigma}+\sqrt{c_{\sigma}\left(2-c_{\sigma}\right) \mu_{\mathrm{eff}}}\left(\mathbf{\Sigma}^{(k)}\right)^{-1 / 2} \boldsymbol{\delta}_{w}
+\end{aligned}
+$$
+
+The variance effective selection mass:
+
+$$
+\mu_{\mathrm{eff}}=\frac{1}{\sum_{i} w_{i}^{2}}
+$$
+
+The sampled deviations:
+
+$$
+\boldsymbol{\delta}_{w}=\sum_{i=1}^{m_{\text {elite }}} w_{i} \boldsymbol{\delta}^{(i)} \text { for } \delta^{(i)}=\frac{\mathbf{x}^{(i)}-\boldsymbol{\mu}^{(k)}}{\sigma^{(k)}}
+$$
+
+これらを用いて次のステップサイズを次のように計算する。
+
+$$
+\begin{aligned}
+\mathbf{p}_{\Sigma}^{(1)} &=\mathbf{0} \\
+\mathbf{p}_{\Sigma}^{(k+1)} & \leftarrow\left(1-c_{\Sigma}\right) \mathbf{p}_{\Sigma}^{(k)}+h_{\sigma} \sqrt{c_{\Sigma}\left(2-c_{\Sigma}\right) \mu_{\mathrm{eff}}} \boldsymbol{\delta}_{w}
+\end{aligned}
+\]
+where
+\[
+h_{\sigma}=\left\{\begin{array}{ll}
+1 & \text { if } \frac{\left\|\mathbf{p}_{\Sigma}\right\|}{\sqrt{1-\left(1-c_{\sigma}\right)^{2(k+1)}}}<\left(1.4+\frac{2}{n+1}\right) \mathbb{E}\|\mathcal{N}(\mathbf{0}, \mathbf{I})\| \\
+0 & \text { otherwise }
+\end{array}\right.
+$$
+
+ここで，
+
+$$
+\begin{array}{l}
+c_{\sigma}=\left(\mu_{\mathrm{eff}}+2\right) /\left(n+\mu_{\mathrm{eff}}+5\right) \\
+d_{\sigma}=1+2 \max (0, \sqrt{\left(\mu_{\mathrm{eff}}-1\right) /(n+1)}-1)+c_{\sigma}
+\end{array}
+$$
+
+である。
+
+4. **分散共分散行列の計算**
+
+平均と同様に累積ベクトルを用いる。
+
+$$
+\begin{aligned}
+\mathbf{p}_{\Sigma}^{(1)} &=\mathbf{0} \\
+\mathbf{p}_{\Sigma}^{(k+1)} & \leftarrow\left(1-c_{\Sigma}\right) \mathbf{p}_{\Sigma}^{(k)}+h_{\sigma} \sqrt{c_{\Sigma}\left(2-c_{\Sigma}\right) \mu_{\mathrm{eff}}} \boldsymbol{\delta}_{w}
+\end{aligned}
+\]
+where
+\[
+h_{\sigma}=\left\{\begin{array}{ll}
+1 & \text { if } \frac{\left\|\mathbf{p}_{\Sigma}\right\|}{\sqrt{1-\left(1-c_{\sigma}\right)^{2(k+1)}}}<\left(1.4+\frac{2}{n+1}\right) \mathbb{E}\|\mathcal{N}(\mathbf{0}, \mathbf{I})\| \\
+0 & \text { otherwise }
+\end{array}\right.
+$$
+
+ただし，分散共分散の重みに負の値は使えないので，次のように重みを更新する。
+$$
+w_{i}^{\circ}=\left\{\begin{array}{cl}w_{i} & \text { if } w_{i} \geq 0 \\ \frac{n w_{i}}{\left\|\Sigma^{-1 / 2} \boldsymbol{\delta}^{(i)}\right\|^{2}} & \text { otherwise }\end{array}\right.
+$$
+
+最終的に，分散共分散行列は次のように得ることができる。
+
+$$
+\mathbf{\Sigma}^{(k+1)} \leftarrow(1+\underbrace{c_{1} c_{c}\left(1-h_{\sigma}\right)\left(2-c_{c}\right)-c_{1}-c_{\mu}}_{\text {typically zero }}) \boldsymbol{\Sigma}^{(k)}+\underbrace{c_{1} \mathbf{p}_{\Sigma} \mathbf{p}_{\Sigma}^{\top}}_{\text {rank-one update }}+\underbrace{c_{\mu} \sum_{i=1}^{\mu} w_{i}^{\circ} \boldsymbol{\delta}^{(i)}\left(\boldsymbol{\delta}^{(i)}\right)^{\top}}_{\text {rank- } \mu \text { update }}
+$$
+
+ここで，
+
+$$
+\begin{array}{l}
+c_{\Sigma}=\frac{4+\mu_{\mathrm{eff}} / n}{n+4+2 \mu_{\mathrm{eff}} / n} \\
+c_{1}=\frac{2}{(n+1.3)^{2}+\mu_{\mathrm{eff}}} \\
+c_{\mu}=\min \left(1-c_{1}, 2 \frac{\mu_{\mathrm{eff}}-2+1 / \mu_{\mathrm{eff}}}{(n+2)^{2}+\mu_{\mathrm{eff}}}\right)
+\end{array}
+$$
+
+である。
+
+### Juliaによる実装
+
+```julia
+function covariance_matrix_adaptation(f, x, k_max;
+    σ = 1.0,
+    m = 4 + floor(Int, 3*log(length(x))),
+    m_elite = div(m,2))
+
+    μ, n = copy(x), length(x)
+    ws = normalize!(vcat(log((m+1)/2) .- log.(1:m_elite), zeros(m - m_elite)), 1)
+    μ_eff = 1 / sum(ws.^2)
+    cσ = (μ_eff + 2)/(n + μ_eff + 5)
+    dσ = 1 + 2max(0, sqrt((μ_eff-1)/(n+1))-1) + cσ
+    cΣ = (4 + μ_eff/n)/(n + 4 + 2μ_eff/n)
+    c1 = 2/((n+1.3)^2 + μ_eff)
+    cμ = min(1-c1, 2*(μ_eff-2+1/μ_eff)/((n+2)^2 + μ_eff))
+    E = n^0.5*(1-1/(4n)+1/(21*n^2))
+    pσ, pΣ, Σ = zeros(n), zeros(n), Matrix(1.0I, n, n)
+    for k in 1 : k_max
+        P = MvNormal(μ, σ^2*Σ)
+        xs = [rand(P) for i in 1 : m]
+        ys = [f(x) for x in xs]
+        is = sortperm(ys) # best to worst
+
+        # selection and mean update
+        δs = [(x - μ)/σ for x in xs]
+        δw = sum(ws[i]*δs[is[i]] for i in 1 : m_elite)
+        μ += σ*δw
+
+        # step-size control
+        C = Σ^-0.5
+        pσ = (1-cσ)*pσ + sqrt(cσ*(2-cσ)*μ_eff)*C*δw
+        σ *= exp(cσ/dσ * (norm(pσ)/E - 1))
+
+        # covariance adaptation
+        hσ = Int(norm(pσ)/sqrt(1-(1-cσ)^(2k)) < (1.4+2/(n+1))*E)
+        pΣ = (1-cΣ)*pΣ + hσ*sqrt(cΣ*(2-cΣ)*μ_eff)*δw
+        w0 = [ws[i]≥0 ? ws[i] : n*ws[i]/norm(C*δs[is[i]])^2 for i in 1:m]
+        Σ = (1-c1-cμ) * Σ +
+            c1*(pΣ*pΣ' + (1-hσ) * cΣ*(2-cΣ) * Σ) +
+            cμ*sum(w0[i]*δs[is[i]]*δs[is[i]]' for i in 1 : m)
+        Σ = triu(Σ)+triu(Σ,1)' # enforce symmetry
+    end
+    return μ
+end
+```
